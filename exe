@@ -1,0 +1,3 @@
+#!/bin/bash
+
+mpirun -np 8 FreeFem++-mpi dnscontrol_linear.edp

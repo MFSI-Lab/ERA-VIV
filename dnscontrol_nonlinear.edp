@@ -1,0 +1,321 @@
+/////////////////// LQG control for the VIV /////////////////////////
+///////////////// Linear model and nonlinear model //////////////////
+/////////////////////////////////////////////////////////////////////
+load "MUMPS_mpi"
+include "/home/jhk/Nonroot/FreeFEM/share/FreeFEM/4.12/examples/plugin/iovtk.edp"
+int[int] Order = [1];
+real Re  = 60.0;
+real nu  = 1./Re;
+real dt;
+real tps = 0.;      
+int nbre,step,p;
+real eps = 1e-10;
+// Parameters for solid
+real mstar = 20.0;
+real Ustar = 12.0;
+real Para1 = pi*mstar/4.0;
+real Para2 = pi^3*mstar/(Ustar^2);
+real velocity = 0;
+real position = 0;
+real acceleration = 0;
+/////////////////////////////////////////////////////////////
+////////////////// Read FEM Variables ///////////////////////
+/////////////////////////////////////////////////////////////
+mesh th = readmesh("../Mesh/mesh.msh");
+th = change(th,fregion = nuTriangle%mpisize); 
+{
+	ifstream file("../Common/param.dat");
+	file >> nbre;		// number of time steps of simulation
+	file >> dt;			// time step
+	file >> step;		// number of time steps to define sampling time
+	file >> p;			// size of stable subspace
+};
+nbre = 1e6;
+string dir = "vect/";
+string filename="impulse_LQG.txt";		// output file at each time step
+{
+   	ofstream f(filename);
+};
+// NL = 0: linearized simulations, NL = 1: non-linear simulation.
+int NL = 0;
+
+// Fespace 
+fespace Xh(th,P2);		////// f.e. space for vel.
+fespace Mh(th,P1);		////// f.e. space for pressure
+fespace XXMh(th,[P2,P2,P1]);	////// f.e. space for triplet [u,v,p]
+XXMh [ux,uy,up];
+XXMh [vx,vy,q];			///////  -> test for Navier-Stokes
+XXMh [Ubx,Uby,Ubp];		///////  -> Base Flow
+XXMh [Oux,Ouy,Oup];		///////  -> Output
+XXMh [Nrhsu,Nrhsv,Nrhsp];
+XXMh [UPx,UPy,UPp];
+////// define the coupled variables ///////
+int Numtot = ux[].n + 3;
+real[int]   c1(Numtot);
+real[int]   u1(Numtot);
+real[int]   f1(Numtot);
+real[int]  uB1(Numtot);
+real[int]  up1(Numtot);
+real[int] upp1(Numtot);
+real[int] rhs1(Numtot);
+
+real[int] NLpu(Numtot);
+real[int] NLppu(Numtot);
+real[int] Out(Numtot-3);
+
+real a0,a1,a2,bet0,bet1;
+a0 = 1.5/dt; a1 = -2./dt; a2 = 0.5/dt; // second order
+bet0 = 2; bet1 = -1;
+real TGVCL = 1e30; // for Diogo
+/////////////////////////////////////////////////////////////////////////////////
+////////////////  Macros       //////////////////////////////////////////////////
+macro div(u) (dx(u#x)+dy(u#y))
+// macro for divergence
+ 
+macro Conv(ua,ub,v) ( 
+	((ua#x*dx(ub#x)+ua#y*dy(ub#x))+(ub#x*dx(ua#x)+ub#y*dy(ua#x)))*v#x 
+	+ ((ua#x*dx(ub#y)+ua#y*dy(ub#y))+(ub#x*dx(ua#y)+ub#y*dy(ua#y)))*v#y 
+                    )
+// macro for mutual convection operator
+
+macro D(u) [[dx(u#x), .5*(dx(u#y)+dy(u#x))], [.5*(dx(u#y)+dy(u#x)), dy(u#y)]] 
+// macro for rate-of-deformation tensor
+
+/////////////////////////////////////////////////////////////////////////////////
+///////////  Load baseflow   ////////////////////////////////////////////////////
+{
+	ifstream file("../BF/cb_"+Re+".txt");
+	file >> Ubx[];
+};
+// Read forcing
+{	  
+	ifstream file("../Actuator/b2.txt");
+	file >> rhs1;
+};	
+// Matrix defining sensor
+{	  
+	ifstream file("../Sensor/c.txt");	// Read measure
+	file >> c1;
+};	
+// Initial condition
+
+{	  
+	ifstream file("Re80_m20_U12_110001_.txt");	
+	file >> u1;
+};
+
+//u1 = 0;
+//u1(Numtot-3) = 1e-10;
+//u1(Numtot-2) = 0;
+//u1(Numtot-1) = 0;
+IFMACRO(!BoundaryconditionsLNSE)
+macro BoundaryconditionsLNSE(u,v)/*For the free movement problem*/
+	 int1d(th,1,4)(u#y*v#y*TGVCL)
+	+int1d(th,1,4)(u#x*v#x*TGVCL) /*useless if domain is big enough:sometimes it introduces errors. But needed if domain is not that big */
+	+int1d(th,2)(u#y*v#y*TGVCL) /* + le terme AAA de interaction sur Avf*/
+	+int1d(th,2)(u#x*v#x*TGVCL)
+	+int1d(th,6)(u#x*v#x*TGVCL)
+//EOM
+ENDIFMACRO
+
+IFMACRO(!Portance)
+macro Portance(u)   
+	(
+	int1d(th,2)(u#p*N.y)
+	-int1d(th,2)( nu*(2*dy(u#y)*N.y+(dx(u#y)+dy(u#x))*N.x))
+	)
+//EOM
+ENDIFMACRO
+
+/////////////////////////////////////////////////////////////////////////////////
+////// BUILD A-MATRIX ///////////////////////////////////////////////////////////
+//varf for generalized eigenvalue problem: 
+varf   LNSE ([ux,uy,up],[vx,vy,q]) =
+	int2d(th,mpirank)
+	( 
+		a0*(ux*vx + uy*vy + up*q*eps)
+		+ Conv(u,Ub,v)		//Terme 2
+		- up*div(v)		    //Terme 3
+		+ 2*nu*(D(u):D(v))	//Terme 4
+		- div(u)*q		    //Terme 5
+		- up*q*(eps) 		//Terme Stabilization
+    )
+ 	+BoundaryconditionsLNSE(-u,v);
+
+matrix OPff = LNSE(XXMh,XXMh,solver = sparsesolver,master=-1);
+
+// Non-linear term
+varf nrhs([ax,ay,ap],[vx,vy,vp]) = 
+	int2d(th,mpirank)
+	(
+		-vx*(UPx*dx(UPx) + UPy*dy(UPx) - u1(Numtot-2)*dy(UPx))
+		-vy*(UPx*dx(UPy) + UPy*dy(UPy) - u1(Numtot-2)*dy(UPy))
+	)
+	+BoundaryconditionsLNSE(-a,v);
+
+////////////////////////////////////////////////////////////////////////////////////
+//Matrix Afv for VIV cylinder		////////////////////////////////////////////
+varf afv([vx,vy,q],[ux,uy,up]) = Portance(u); // Calculate the Lift force for solid equation 
+real[int] Afv = afv(0,XXMh); // maniere de construire un vecteur COLONNE qui sera ensuite transpose
+
+////////////////////////////////////////////////////////////////////////////////////
+///////////// Only this term need to be analized  //////////////////////////////////
+
+varf avbfluid([ux,uy,up],[vx,vy,q]) = // Y
+		int1d(th,2)(vy*TGVCL) // v = V on body if absolute velocity, here we mulity -1.0
+	   +int2d(th,mpirank)( -1.0*(vx*dy(Ubx) + vy*dy(Uby)) ); // term for RA formulation
+
+real[int] Avf(ux[].n);
+Avf = avbfluid(0,XXMh);
+
+////////////////////////////////////////////////////////////////////////////////////
+//Matrix A for VIV cylinder   	 	 ///////////////////////////////////////////
+
+matrix AFluid;
+
+AFluid = 	[
+	[OPff,		  0,	 Avf,		      0],
+	[   0,		 a0,	  1.,	 		  0],
+	[   0,		  0,	  a0,		 	  1],
+	[Afv',	  Para2,	   0,  Para1-a0*eps]
+	];
+
+set(AFluid,solver = sparsesolver,master=-1);
+
+/////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////
+////// BUILD B-MATRIX ///////////////////////////////////////////////////////////
+//Matrix B for fixed cylinder
+varf Mass([ux,uy,up],[vx,vy,q]) = 
+	 int2d(th,mpirank)( (ux*vx+uy*vy+up*q*eps) );
+matrix MassMat = Mass(XXMh,XXMh,solver=sparsesolver);  
+
+/////////////////////////////////////////////////////////////////////////////////
+// Terms of Matrix B for VIV cylinder
+matrix BFluid = 
+		[ 	[MassMat, 0,	  0,	 0],
+			[0,	      1,	  0,	 0],
+			[0,	      0,	  1,	 0],
+			[0,	      0,	  0,   eps]	//TERME DE STABILIZATION
+		];
+set(BFluid,solver = sparsesolver,master=-1);
+
+/////////////////////////////////////////////////////////////////////
+///////////////////// load control //////////////////////////////////
+////////////////////////////////////////////////////////////////////
+
+int ns = p;
+real[int,int] J(ns,ns);     
+real[int] L(ns),K(ns);
+real[int] Xe(ns),Xp(ns);     // state vector of control law
+real m,mp;  // measure and pervious measure
+// Matrix J
+{
+	ifstream file("../LQG/J.txt");
+	for(int i = 1; i <= ns; i++)
+	{
+		for(int j = 1; j <= ns; j++)
+		{
+			file >> J(j-1,i-1);
+		};
+	};
+};
+////////////
+// K
+////////////
+{
+	ifstream file("../LQG/K.txt");
+	for(int k = 1; k <= ns; k++)
+	{
+		file >> K(k-1);
+	};
+};
+////////////
+// L
+////////////
+{
+	ifstream file("../LQG/L.txt");
+	for(int k = 1; k <= ns; k++)
+	{
+		file >> L(k-1);
+	};
+};
+/////////////////////////////////////////////////////
+////////////////// end //////////////////////////////
+/////////////////////////////////////////////////////
+
+real v = 0;	// At initial time, noise is equal to 0
+real u = 0 + v;	// At initial time, control is equal to 1
+m  = c1'*u1;	// initial measure
+cout << "m = " << m << endl;
+Xe = 0;
+//u1 = 0;
+f1 = BFluid*rhs1;		
+/////////////////////////////////////////////////////////////
+///////////////////////// Timer /////////////////////////////
+/////////////////////////////////////////////////////////////
+for (int i = 1;i <= nbre; i++)
+{		
+// update
+	upp1 = up1;
+	up1  = BFluid*u1;
+
+	Xp = Xe;
+	mp = m;
+	
+	rhs1  = -a1*up1 - a2*upp1;		// build right-hand-side
+	rhs1 += u*f1;					// take into account forcing
+
+//// consider the nonlinear effect
+	if (NL == 1)
+	{
+		for (int k = 0; k < Numtot-3; k++)
+		{
+			Out(k) = u1(k);
+		}
+		UPx[]   = Out;
+		NLppu   = NLpu;
+		Nrhsu[] = nrhs(0,XXMh);
+		NLpu  = [Nrhsu[],0,0,0];
+		rhs1 += bet0*NLpu + bet1*NLppu;
+	}
+//// end
+
+	u1   = AFluid^-1*rhs1;			// compute new flowfield
+
+	tps += dt;						// advance time-step
+	Xe  = -mp*L;
+	Xe += J*Xp; 					// new estimated state
+	u = K'*Xe + v;					// new control    
+	m = c1'*u1;				  // new measurement
+
+////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////
+// POST PROCESSING
+	if(mpirank == 0)
+	{
+	cout << " tps = " << tps << "  CPU_time = " << clock() << endl;             
+	{
+		real Lift = int1d(th,2)(UPp*N.y) - int1d(th,2)( nu*(2*dy(UPy)*N.y+(dx(UPy)+dy(UPx))*N.x));
+		ofstream f(filename,append);
+		f.precision(16);
+		f << tps << " " << m << " " << u1(Numtot-3) << " " << u1(Numtot-2) << " " << u1(Numtot-1) << " " << u << " " << 2.0*Lift << endl; 
+	};
+	    
+		if((i%100) == 1) 
+		{
+			ofstream file(dir+"Re80_m20_U12_"+(100000+i)+"_.txt");
+        	file.precision(16);
+        	file << u1 << endl;
+			/*
+			for (int k = 0; k < Numtot-3; k++)
+			{
+				Out(k) = u1(k);
+			}
+			Oux[] = Out;
+			savevtk(dir+"iter="+i+"_Re60.vtk", th, [Oux,Ouy,Oup], dataname="T", order=Order,bin=false);
+			*/
+		}
+		
+	}
+};
