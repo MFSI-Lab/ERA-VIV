@@ -1,0 +1,6 @@
+4001
+0.02
+1
+20
+18
+// number of time steps in simulation / time step in simulation / number of time steps defining sampling time for reduced order models / approximation size of Gramians
