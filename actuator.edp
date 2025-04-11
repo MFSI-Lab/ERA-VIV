@@ -1,0 +1,28 @@
+include "../Common/intro.edp"
+include "/home/jhk/FreeFem-sources/examples/plugin/iovtk.edp"
+int[int] Order = [1];
+real sigma = 0.07;	// width of gaussian forcing
+real radius = 0.4*1.4142135;
+real xita   = 45 * pi/180;
+real x0    = radius * cos(xita);		// location
+real y0    = radius * sin(xita);
+real y1    = -y0;
+real lmd   = 1e0;
+Up select  = (sqrt((x-x0)^2 + (y-y0)^2) <= 0.2)*exp(-((x-x0)^2+(y-y0)^2)/2/sigma^2)
+            +(sqrt((x-x0)^2 + (y-y1)^2) <= 0.2)*exp(-((x-x0)^2+(y-y1)^2)/2/sigma^2);	// set forcing to zero outside a circle of radius 0.4
+//
+Uvvp [u,v,p];
+int Numtot = u[].n + 3;
+real[int] Act(Numtot);
+
+//,select*y/abs(y+1e-30)*sin(xita)/sin(pi/4)
+[u,v,p] = lmd*[select*y/abs(y+1e-30),0,0];	// forcing on v-component
+Act = [u[],0,0,0];
+{
+   ofstream file("b2.txt");
+   file.precision(16);
+   file << Act;
+//   file << u[];
+};
+plot(v,wait = 1,value = 1);
+savevtk("CylinderFlow_Actustor.vtk", th, [u,v,0], dataname = "U", order = Order,bin = false);
